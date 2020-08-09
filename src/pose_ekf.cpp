@@ -60,7 +60,7 @@ MatrixXd diff_qvqstar_q(Quaterniond q, Vector3d v)
 	Vector3d qv = q.vec();
 	MatrixXd D(3, 4);
 	D.col(0) = 2*(q0*v + skew_symmetric(qv)*v);
-	D.block<3, 3>(0, 1) = 2*(-v*qv.transpose() + v.dot(qv)*Matrix3d::Identity() - q0*skew_symmetric(v));
+	D.block<3, 3>(0, 1) = 2*(-v*qv.transpose() + v.dot(qv)*Matrix3d::Identity() + qv * v.transpose() - q0*skew_symmetric(v));
 	return D; 
 }
 
