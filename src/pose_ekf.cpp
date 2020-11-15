@@ -1,351 +1,324 @@
 #include "pose_ekf.h"
-#include <iostream>
-#include <Eigen/Dense>
-#include "conversion.h"
-using namespace std;
-using namespace Eigen;
 
-
-//quaternion: body fram to navigation frame
-//Rnb
-// state for kalman filter
-// 0-3 quaternion
-// 4-6 Px Py Pz
-// 7-9 Vx Vy Vz
-// 10-12 bwx bwy bwz
-// 13-15 bax bay baz 
-// inertial frame: ENU
-
-Matrix3d skew_symmetric(Vector3d v)
+Matrix3d _skew_symmetric3(Vector3d v)
 {
-	Matrix3d m;
-	m << 0, -v(2), v(1),
-		 v(2), 0,  -v(0),
-		 -v(1), v(0), 0;
-	return m;
+    Matrix3d m;
+    m << 0, -v(2), v(1),
+        v(2), 0, -v(0),
+        -v(1), v(0), 0;
+    return m;
 }
 
-//diff_(p*q) /diff_q
-Matrix4d diff_pq_q(Quaterniond p)
+pose_ekf::pose_ekf()
 {
-	double p0 = p.w();
-	Vector3d pv = p.vec();
+    is_init_done = false;
+    is_atti_init_done = false;
+    this->pos.setZero();
+    this->vel.setZero();
+    this->q.setIdentity();
+    this->acc_bias.setZero();
+    this->gyro_bias.setZero();
+}
+pose_ekf::~pose_ekf()
+{
 
-	Matrix4d D;
-	D(0, 0) = p0;
-	D.block<1, 3>(0, 1) = -pv.transpose();
-	D.block<3, 1>(1, 0) = pv;
-	D.block<3, 3>(1, 1) = Matrix3d::Identity()*p0 + skew_symmetric(pv);
-	return D;
 }
 
 
-//diff_(p*q)/ diff_p
-Matrix4d diff_pq_p(Quaterniond q)
+void pose_ekf::set_P_matrix()
 {
-	double q0 = q.w();
-	Vector3d qv = q.vec();
-	Matrix4d D;
-	D(0, 0) = q0;
-	D.block<1, 3>(0, 1) = -qv.transpose();
-	D.block<3, 1>(1, 0) = qv;
-	D.block<3, 3>(1, 1) = Matrix3d::Identity()*q0 - skew_symmetric(qv);
-	return D;
+    VectorXd p = VectorXd::Ones(n);
+    p.segment(0, 3) = Vector3d::Ones() * gps_pos_noise * gps_pos_noise;
+    p.segment(3, 3) = Vector3d::Ones() * gps_vel_noise * gps_vel_noise;
+    p.segment(6, 3) = Vector3d::Ones() * 0.01 * 0.01;
+    p.segment(9, 3) = Vector3d::Ones() * 0.01 * 0.01;
+    p.segment(12, 3) = Vector3d::Ones() * 0.01 * 0.01;
+    kf.eskf_init_P(p);
+}
+void pose_ekf::set_Q_matrix(double dt)
+{
+    Q = MatrixXd::Zero(n, n);
+    Matrix3d I3 = Matrix3d::Identity();
+    Q.block(0, 0, 3, 3) = I3 * gps_vel_noise * gps_vel_noise;
+    Q.block(3, 3, 3, 3) = I3 * acc_noise * acc_noise;
+    Q.block(6, 6, 3, 3) = I3 * gyro_noise * gyro_noise;
+    Q.block(9, 9, 3, 3) = I3 * acc_bias_noise * acc_bias_noise;
+    Q.block(6, 12, 3, 3) = -gyro_bias_noise * gyro_bias_noise * I3 * dt * dt / 2.0;
+    Q.block(12, 6, 3, 3) = -gyro_bias_noise * gyro_bias_noise * I3 * dt * dt / 2.0;
+    Q.block(12, 12, 3, 3) = I3 * gyro_bias_noise * gyro_bias_noise;
 }
 
-//diff_(q*v*q_star)/ diff_q
-MatrixXd diff_qvqstar_q(Quaterniond q, Vector3d v)
+void pose_ekf::pose_init(Vector3d pos, Vector3d vel)
 {
-	double q0 = q.w();
-	Vector3d qv = q.vec();
-	MatrixXd D(3, 4);
-	D.col(0) = 2*(q0*v + skew_symmetric(qv)*v);
-	D.block<3, 3>(0, 1) = 2*(-v*qv.transpose() + v.dot(qv)*Matrix3d::Identity() + qv * v.transpose() - q0*skew_symmetric(v));
-	return D; 
+    kf = eskf(n);
+
+    this->pos = pos;
+    this->vel = vel;
+    is_init_done = true;
+
+    this->set_Q_matrix(1.0 / imu_freq);
+    this->set_P_matrix();
+    print_state();
 }
 
-//diff_(qstar*v*q)/ diff_q
-MatrixXd diff_qstarvq_q(Quaterniond q, Vector3d v)
+void pose_ekf::atti_init(Vector3d acc)
 {
-	double q0 = q.w();
-	Vector3d qv = q.vec();
-	MatrixXd D(3, 4);
-	D.col(0) = 2*(q0*v - skew_symmetric(qv)*v);
-	D.block<3, 3>(0, 1) = 2*(-v*qv.transpose() + v.dot(qv)*Matrix3d::Identity() + q0*skew_symmetric(v));
-	return D; 
-}
-//diff_(q*v*q_star)/ diff_v
-Matrix3d diff_qvqstar_v(Quaterniond q)
-{
-	double q0 = q.w();
-	Vector3d qv = q.vec();
-	Matrix3d D;
-	D = (q0*q0 - qv.dot(qv))*Matrix3d::Identity() + 2*qv*qv.transpose() + 2*q0*skew_symmetric(qv);
-	return D; 
+    //cout << "gravity: " << this->gravity.transpose() << endl;
+    //cout << "acc: " << acc.transpose() << endl;
+    this->q.setFromTwoVectors(acc, gravity);
+
+    is_atti_init_done = true;
+    cout << "atti init with acc " << endl;
+
+    this->set_Q_matrix(1.0 / imu_freq);
+    this->set_P_matrix();
+    this->print_state();
 }
 
-Pose_ekf::Pose_ekf()
-{	
-	initialized = false;
-	x = VectorXd::Zero(n_state);
-	x.head(4) << 1, 0, 0, 0;
-	P = MatrixXd::Identity(n_state, n_state);
+void pose_ekf::atti_init(Vector3d acc_raw, Vector3d mag)
+{
+    //cout << "gravity: " << this->gravity.transpose() << endl;
+    //cout << "acc: " << acc.transpose() << endl;
+    Vector3d acc = acc_raw - acc_bias;
+    this->q.setFromTwoVectors(acc, this->gravity);
 
-	Q = MatrixXd::Zero(6, 6);
-	Q.block<3, 3>(0, 0) = Matrix3d::Identity()*gyro_cov;
-	Q.block<3, 3>(3, 3) = Matrix3d::Identity()*acc_cov;
+    Vector3d mag_ned = q.toRotationMatrix() * mag;
+    mag_ned(2) = 0; //remove z direction
+    Vector3d mag_hori = mag_ned.normalized();
 
+    Quaterniond dq;
+    dq.setFromTwoVectors(mag_hori, magnetic);
 
-	initialized = false;
-	fix_initialized = false;
-	imu_initialized = false;
-	altimeter_initialized = false;
-	sonar_initialized = false;
-	magnetic_initialized = false;
+    this->q = dq * this->q;
+
+    is_atti_init_done = true;
+    cout << "atti ekf init with acc and mag" << endl;
+    this->print_state();
 }
 
-Pose_ekf::~Pose_ekf()
+void pose_ekf::predict(Vector3d omega_raw, Vector3d acc_raw, double dt)
 {
-	
+    Vector3d acc = acc_raw - acc_bias;
+    Vector3d omega = omega_raw - gyro_bias;
+
+    Quaterniond dq;
+    dq.vec() = omega * dt * 0.5;
+    dq.w() = sqrt(1.0 - dq.vec().dot(dq.vec()));
+    this->q *= dq;
+    if (q.w() < 0) q.coeffs() *= -1;
+
+    Matrix3d Rot = q.toRotationMatrix(); //body to NED
+    Vector3d acc_ned = Rot * acc;
+    Vector3d linear_acceleration = acc_ned - gravity;
+
+    pos += (vel * dt + 0.5 * linear_acceleration * dt * dt);
+    vel += linear_acceleration * dt;
+
+    Matrix3d Rnb = Rot;//body to ned
+    //update P matrix, TODO
+    Phi = MatrixXd::Identity(n, n);
+    Matrix3d I3 = Matrix3d::Identity();
+    // Phi.block(3, 6, 3, 3) = -I3 * dt + dt * dt * _skew_symmetric3(linear_acceleration);
+
+    //first order
+    //pos part
+    Phi.block(0, 3, 3, 3) = I3 * dt;
+
+    //vel part
+    Phi.block(3, 6, 3, 3) = -Rnb * _skew_symmetric3(acc) * dt;
+    Phi.block(3, 9, 3, 3) = -Rnb * dt;
+
+    //rot part, indirect kalman filter
+    Phi.block(6, 6, 3, 3) = I3 - _skew_symmetric3(omega) * dt;
+    Phi.block(6, 12, 3, 3) = -I3 * dt + dt * dt / 2.0 * _skew_symmetric3(omega);
+
+    //higher order
+    //pos part
+    // Phi.block(0, 3, 3, 3) = I3 * dt;
+    // Phi.block(0, 6, 3, 3) = -Rnb * _skew_symmetric3(acc) * 0.5 * dt * dt;
+    // Phi.block(3, 9, 3, 3) = -Rnb * 0.5 * dt * dt;
+    // Phi.block(3, 12, 3, 3)= Rnb * _skew_symmetric3(acc) * 0.5 * dt * dt;
+
+    // //vel part
+    // Phi.block(3, 6, 3, 3) = -Rnb * _skew_symmetric3(acc) *(I3 - 0.5 * _skew_symmetric3(omega)* dt)* dt;
+    // Phi.block(3, 9, 3, 3) = -Rnb * dt;
+
+    // //rot part, indirect kalman filter
+    // Phi.block(6, 6, 3, 3) = I3 - _skew_symmetric3(omega) * dt;
+    // Phi.block(6, 12, 3, 3) = -I3 * dt + dt * dt / 2.0 * _skew_symmetric3(omega);
+
+    MatrixXd Fi = MatrixXd::Zero(n, n-3);
+    MatrixXd QQ = MatrixXd::Zero(n-3, n-3);
+    Fi.block(3, 0, n-3, n-3) = MatrixXd::Identity(n-3, n-3);
+    QQ.block(0, 0, 3, 3) = I3 * ACC_NOISE_DENSITY * ACC_NOISE_DENSITY * dt;
+    QQ.block(3, 3, 3, 3) = I3 * GYRO_NOISE_DENSITY * GYRO_NOISE_DENSITY * dt;
+    QQ.block(6, 6, 3, 3) = I3 * ACC_RANDOM_WALK * ACC_RANDOM_WALK;
+    QQ.block(9, 9, 3, 3) = I3 * GYRO_RANDOM_WALK * GYRO_RANDOM_WALK;
+    //kf.P = Phi * kf.P * Phi.transpose() + Q;
+    kf.P = Phi * kf.P * Phi.transpose() + Fi * QQ * Fi.transpose();
+
+    // MatrixXd QQQ = Fi * QQ * Fi.transpose();
+    // cout << "QQQ: " << QQQ << endl;
+    // cout << "P: " << kf.P << endl;
 }
 
-
-void Pose_ekf::predict(Vector3d gyro, Vector3d acc, double t)
+void pose_ekf::update_gps(Vector3d pos, Vector3d vel)
 {
-	if(!imu_initialized)
-	{
-		imu_initialized = true; initialized = true;
-		this->current_t = t;
-		double phy = atan2(acc(1), acc(2));
-		double theta = atan2(-acc(0), acc(2));
-		Vector3d rpy(phy, theta, 0);
-		Quaterniond q = euler2quaternion(rpy);
-		x(0) = q.w(); x.segment<3>(1) = q.vec();
-		return;
-	}
-	if(t <= current_t) return;
+    MatrixXd H = MatrixXd::Zero(6, n);
+    H.block(0, 0, 3, 3) = Matrix3d::Identity();
+    H.block(3, 3, 3, 3) = Matrix3d::Identity();
 
-	double dt = t - current_t;
-	VectorXd xdot(n_state);
-	MatrixXd F(n_state, n_state);
-	MatrixXd G(n_state, 6);//G = dx/du
 
-	process(gyro, acc, xdot, F, G);
-	
-	x += xdot*dt;
-	F = MatrixXd::Identity(n_state, n_state) + F*dt;//continous F and discrete F
-	G = G*dt;
-	// cout << "G: " << G << endl;
-	// cout << "GQG: " << G*Q*G << endl;
+    MatrixXd R = MatrixXd::Zero(6, 6);
+    R.block(0, 0, 3, 3) = Matrix3d::Identity() * gps_pos_noise;
+    R.block(3, 3, 3, 3) = Matrix3d::Identity() * gps_vel_noise;
 
-	P = F*P*F.transpose() + G*Q*G.transpose();
-	x.head(4).normalize();
-	
-	this->current_t = t;
-	this->acc = acc;
-	this->gyro = gyro;
+    VectorXd delta = VectorXd::Zero(6);
+    delta.segment(0, 3) = pos - this->pos;
+    delta.segment(3, 3) = vel - this->vel;
+
+    kf.update(delta, H, R);
+
+    update_state();
+    this->delta_gps = delta;
 }
 
-//xdot = f(x, u);
-void Pose_ekf::process(Vector3d gyro, Vector3d acc, VectorXd& xdot, MatrixXd& F, MatrixXd& G)
+void pose_ekf::update_gps_vel(Vector3d vel)
 {
-	
-	Quaterniond q;
-	Vector3d p, v, bw, ba;
-	getState(q, p, v, bw, ba);
-	
-	xdot.setZero();
-	F.setZero();
-	G.setZero();
-	
-	Quaterniond gyro_q(0, 0, 0, 0);
-	gyro_q.vec() = gyro - bw;
-	Quaterniond q_dot = q*gyro_q;
-	q_dot.w() /= 2; q_dot.vec() /= 2;//* and / to scalar is not support for Quaternion
-	xdot(0) = q_dot.w(); xdot.segment<3>(1) = q_dot.vec();
-	xdot.segment<3>(4) = v;
 
-	Quaterniond acc_b_q(0, 0, 0, 0);
-	acc_b_q.vec() = acc - ba;
-	Quaterniond acc_n_q =  q*acc_b_q*q.inverse();
-	xdot.segment<3>(7) = acc_n_q.vec() - GRAVITY;//body frame to n frame 
-	
-	F.block<4, 4>(0, 0) = 0.5*diff_pq_p(gyro_q);
-	F.block<4, 3>(0, 10) = -0.5*(diff_pq_q(q).block<4, 3>(0, 1));
-	F.block<3, 3>(4, 7) = Matrix3d::Identity();
-	F.block<3, 4>(7, 0) = diff_qvqstar_q(q, acc_b_q.vec());
-	F.block<3, 3>(7, 13) = -diff_qvqstar_v(q);
+    MatrixXd H = MatrixXd::Zero(3, n);
+    H.block(0, 3, 3, 3) = Matrix3d::Identity();
 
-	//G = d_xdot/du
-	G.block<4, 3>(0, 0) = 0.5*diff_pq_q(q).block<4, 3>(0, 1);//diff(0.5*q*gyro_q)/diff(gyro_q)
-	G.block<3, 3>(7, 3) = diff_qvqstar_v(q);//diff(q*a*qstar)/diff(a)
+    Matrix3d R = Matrix3d::Identity() * gps_vel_noise * gps_vel_noise;
+
+    Vector3d delta = vel - this->vel;
+    kf.update(delta, H, R);
+
+    update_state();
+    this->delta_vel = delta;
 }
 
-void Pose_ekf::getState(Quaterniond& q, Vector3d& p, Vector3d& v, Vector3d & bw, Vector3d& ba)
+void pose_ekf::update_gps_pos(Vector3d pos)
 {
-	q.w() = x(0);
-	q.vec() = x.segment<3>(1);
-	p = x.segment<3>(4);
-	v = x.segment<3>(7);
-	bw = x.segment<3>(10);
-	ba = x.segment<3>(13);
+    MatrixXd H = MatrixXd::Zero(3, n);
+    H.block(0, 0, 3, 3) = Matrix3d::Identity();
+
+    Matrix3d R = Matrix3d::Identity() * gps_pos_noise * gps_pos_noise;
+
+    Vector3d delta = pos - this->pos;
+    kf.update(delta, H, R);
+
+    update_state();
+    this->delta_pos = delta;
 }
 
-
-void Pose_ekf::measurement_fix(Vector2d& position, MatrixXd &H)
+void pose_ekf::update_acc(Vector3d acc_raw)
 {
-	position = x.segment<2>(4);
-	H = MatrixXd::Zero(2, n_state);
-	H.block<2, 2>(0, 4) = Matrix2d::Identity();
-}
-void Pose_ekf::measurement_fix_velocity(Vector3d& velocity, MatrixXd& H)
-{
-	velocity = x.segment<3>(7);
-	H = MatrixXd::Zero(3, n_state);
-	H.block<3, 3>(0, 7) = Matrix3d::Identity();
-}
 
-void Pose_ekf::measurement_sonar_height(VectorXd& sonar_height, MatrixXd& H)
-{
-	sonar_height = VectorXd(1);
-	sonar_height(0) = x(6);
-	H = MatrixXd::Zero(1, n_state);
-	H(0, 6) = 1;
-}
+    Vector3d acc = acc_raw - acc_bias;
 
-void Pose_ekf::measurement_magnetic_field(Vector3d& magnetic_field, MatrixXd& H)
-{
-	Quaterniond q;
-	q.w() = x(0); q.vec() = x.segment<3>(1);
-	Quaterniond ref_mag_q;
-	ref_mag_q.w() = 0; ref_mag_q.vec() = referenceMagneticField_;
-	Quaterniond magnetic_field_q =  q.inverse()*ref_mag_q*q; //r_n to r_b
-	magnetic_field = magnetic_field_q.vec();
+    Matrix3d Rot = q.toRotationMatrix().transpose();
+    Vector3d vz = Rot * gravity;
 
-	H = MatrixXd::Zero(3, n_state);
-	H.block<3, 4>(0, 0) = diff_qstarvq_q(q, referenceMagneticField_);
+    Quaterniond dq;
+    dq.setFromTwoVectors(acc, vz);
+
+    AngleAxisd angle_axis(dq);
+    Vector3d delta_theta = angle_axis.angle() * angle_axis.axis();
+    this->delta_theta_acc = delta_theta;
+    //cout << "delta_theta: " << delta_theta.transpose() << endl;
+
+    MatrixXd H = MatrixXd::Zero(3, n);
+    H.block(0, 6, 3, 3) = Matrix3d::Identity();
+
+    //cout << "H: " << H << endl;
+    Matrix3d R = Matrix3d::Identity() * acc_noise;
+    kf.update(delta_theta, H, R);
+    update_state();
 }
 
-void Pose_ekf::measurement_gravity(Vector3d& acc, MatrixXd& H)
+void pose_ekf::update_linear_acc(Vector3d linear_acc, Vector3d acc)
 {
-	Quaterniond q;
-	q.w() = x(0); q.vec() = x.segment<3>(1);
-	Vector3d ba = x.segment<3>(13);
-	Quaterniond g_n_q;
-	g_n_q.w() = 0; g_n_q.vec() = Vector3d(0, 0, 1);//only direction is used
-	Quaterniond acc_q =  q.inverse()*g_n_q*q; //r_n to r_b
-	acc = acc_q.vec();
+    Vector3d ag = linear_acc + gravity;
+    Matrix3d Rot = q.toRotationMatrix().transpose();
+    Vector3d vz = Rot * ag;
 
-	H = MatrixXd::Zero(3, n_state);
-	H.block<3, 4>(0, 0) = diff_qstarvq_q(q, GRAVITY);
+    Quaterniond dq;
+    dq.setFromTwoVectors(acc, vz);
+
+    AngleAxisd angle_axis(dq);
+    Vector3d delta_theta = angle_axis.angle() * angle_axis.axis();
+    this->delta_theta_acc = delta_theta;
+    cout << "delta_theta: " << delta_theta.transpose() << endl;
+
+    MatrixXd H = MatrixXd::Zero(3, n);
+    H.block(0, 6, 3, 3) = Matrix3d::Identity();
+
+    //cout << "H: " << H << endl;
+    Matrix3d R = Matrix3d::Identity() * acc_noise;
+    kf.update(delta_theta, H, R);
+
+    update_state();
 }
-
-
-void Pose_ekf::correct(VectorXd z, VectorXd zhat, MatrixXd H, MatrixXd R)
+void pose_ekf::update_magnetic(Vector3d mag_raw)
 {
-   	MatrixXd K = P*H.transpose()*(H*P*H.transpose() + R).inverse();
-    x += K*(z - zhat);
+    printf("%s, %d\n", __FUNCTION__, __LINE__);
+    print_state();
+    //TODO magenetic in horizon
+    Vector3d mag_ned = q.toRotationMatrix() * mag_raw;
     
-    MatrixXd I = MatrixXd::Identity(n_state, n_state);
-    P = (I - K*H)*P;
-    x.head(4).normalize();	
+    cout << "mag_ned: " << mag_ned.transpose() << endl;
+
+    mag_ned(2) = 0; //remove z direction
+    Vector3d mag_hori = q.toRotationMatrix().transpose() * mag_ned;
+    cout << "mag_hori: " << mag_hori.transpose() << endl;
+
+
+
+    Matrix3d Rot = q.toRotationMatrix().transpose();
+    Vector3d vx = Rot * magnetic;
+
+    Quaterniond dq;
+    dq.setFromTwoVectors(mag_raw, vx);
+
+    AngleAxisd angle_axis(dq);
+    Vector3d delta_theta = angle_axis.angle() * angle_axis.axis();
+    this->delta_theta_mag = delta_theta;
+    //cout << "delta_theta: " << delta_theta.transpose() << endl;
+
+    MatrixXd H = MatrixXd::Zero(3, n);
+    H.block(0, 6, 3, 3) = Matrix3d::Identity();
+    //cout << "H: " << H << endl;
+    Matrix3d R = Matrix3d::Identity() * mag_noise * mag_noise;
+    R(0, 0) *= 100;
+    R(1, 1) *= 100;
+    R = q.toRotationMatrix().transpose() * R * q.toRotationMatrix();
+    kf.update(delta_theta, H, R);
+    update_state();
 }
 
-void Pose_ekf::correct_fix(Vector3d position, double t)
+void pose_ekf::update_state()
 {
-	if(!initialized)
-	{
-		initialized = true;
-		this->current_t = t;
-		return;
-	}
+    VectorXd dx = kf.get_state();
+    cout << "kf.dx: " << dx.transpose() << endl;
+    pos += dx.segment(0, 3);
+    vel += dx.segment(3, 3);
 
-	if(t < current_t) return;
-	
-	predict(this->gyro, this->acc, t);
-	double dt = t - current_t;
-	Vector2d z = position.head(2);
-	Vector2d zhat;
-	MatrixXd H;
-	measurement_fix(zhat, H);
-	correct(z, zhat, H, R_fix);
-}
-void Pose_ekf::correct_fix_velocity(Vector3d velocity, double t)
-{
-	if(!initialized)
-	{
-		initialized = true;
-		this->current_t = t;
-		return;
-	}
-
-	if(t < current_t) return;
-	
-	predict(this->gyro, this->acc, t);
-	
-	Vector3d z = velocity;
-	Vector3d zhat;
-	MatrixXd H;
-	measurement_fix_velocity(zhat, H);
-	correct(z, zhat, H, R_fix_velocity);
-}
-void Pose_ekf::correct_sonar_height(double sonar_height, double t)
-{
-	if(!initialized)
-	{
-		initialized = true;
-		this->current_t = t;
-		return;
-	}
-
-	if(t < current_t) return;	
-	predict(this->gyro, this->acc, t);
-
-	VectorXd z(1);
-	z(0) = sonar_height;
-	VectorXd zhat(1);
-	MatrixXd H;
-
-	measurement_sonar_height(zhat, H);
-	correct(z, zhat, H, R_sonar_height);
+    Quaterniond dq;
+    dq.vec() = dx.segment(6, 3) * 0.5;
+    dq.w() = sqrt(1.0 - dq.vec().dot(dq.vec()));
+    q = q * dq;
+    q.normalize();
+    if (q.w() < 0) q.coeffs() *= -1;
+    acc_bias += dx.segment(9, 3);
+    gyro_bias += dx.segment(12, 3);
 }
 
-void Pose_ekf::correct_magnetic_field(Vector3d mag, double t)
+void pose_ekf::print_state()
 {
-	if(!magnetic_initialized)
-	{
-		//note, mag in ENU should be [0 1 x], but for the simulated data it is [1 0 x], maybe a bug
-		referenceMagneticField_(0) = mag.head(2).norm();//todo
-		referenceMagneticField_(1) = 0;
-		referenceMagneticField_(2) = mag(2);
-		magnetic_initialized = true;
-		current_t = t;
-		return;
-	}
-	if(t < current_t) return;
-	predict(this->gyro, this->acc, t);
-	
-	Vector3d z = mag;
-	Vector3d zhat;
-	MatrixXd H;
-	measurement_magnetic_field(zhat, H);
-	correct(z, zhat, H, R_magnetic);
-}
-
-void Pose_ekf::correct_gravity(Vector3d acc, double t)
-{
-	if(!initialized)
-	{
-		initialized = true;
-		this->current_t = t;
-		return;
-	}
-	if(t < current_t) return;
-	predict(this->gyro, this->acc, t);
-	
-	Vector3d z = acc/acc.norm();
-	Vector3d zhat;
-	MatrixXd H;
-	measurement_gravity(zhat, H);
-	correct(z, zhat, H, R_gravity);
+    cout << "pos: " << pos.transpose() << endl;
+    cout << "vel: " << vel.transpose() << endl;
+    cout << "q: " << q.w() << "  " <<  q.vec().transpose() << endl;
+    cout << "acc_bias: " << acc_bias.transpose() << endl;
+    cout << "gyro_bias: " << gyro_bias.transpose() << endl;
 }

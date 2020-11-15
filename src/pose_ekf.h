@@ -1,85 +1,73 @@
 #ifndef __POSE_EKF_H
 #define __POSE_EKF_H
+#include "eskf.h"
+#include "sensor_config.h"
 #include <iostream>
-#include <Eigen/Dense>
+#include <Eigen/Eigen>
 
 using namespace std;
 using namespace Eigen;
 
-// state for kalman filter
-// 0-3 quaternion
-// 4-6 Px Py Pz
-// 7-9 Vx Vy Vz
-// 10-12 bwx bwy bwz
-// 13-15 bax bay baz 
-// inertial frame: ENU
-
-class Pose_ekf
+class pose_ekf
 {
 public:
-	Pose_ekf();
-	~Pose_ekf();	
-	void predict(Vector3d gyro, Vector3d acc, double t);
-	void correct(Vector3d pos, Vector3d vel, Vector3d mag, double t);
-	void process(Vector3d gyro, Vector3d acc, VectorXd& xdot, MatrixXd& F, MatrixXd& G);
-	MatrixXd computeF(Vector3d gyro, Vector3d acc);
-	
-	VectorXd measurement(VectorXd x, Vector3d mag);
-	MatrixXd computeH(Vector3d mag);
+    //state vector[p, v, q, ba, bw]
+    Vector3d pos;
+    Vector3d vel;
+    Quaterniond q;
+    Vector3d acc_bias;
+    Vector3d gyro_bias;
 
-	void measurement_fix(Vector2d& position, MatrixXd &H);
-	void measurement_fix_velocity(Vector3d& velocity, MatrixXd& H);
-	void measurement_sonar_height(VectorXd& sonar_height, MatrixXd& H);
-	void measurement_magnetic_field(Vector3d& magnetic_field, MatrixXd& H);
-	void measurement_gravity(Vector3d& acc, MatrixXd& H);
+    const int n = 15;
+    double imu_freq = 100;
+    double timestamp;
 
-	void correct(VectorXd z, VectorXd zhat, MatrixXd H, MatrixXd R);
-	void correct_fix(Vector3d position, double t);
-	void correct_fix_velocity(Vector3d velocity, double t);
-	void correct_sonar_height(double sonar_height, double t);//todo, without considering the roll and pitch
-	void correct_magnetic_field(Vector3d mag, double t);
-	void correct_gravity(Vector3d acc, double t);
-	// void measurement_altimeter(double& altimeter_height, MatrixXd H);
-	void getState(Quaterniond& q, Vector3d& position, Vector3d& velocity, Vector3d & bw, Vector3d&  ba);
-	double get_time() { return current_t;}
-private:
-	VectorXd x;//state 
-	MatrixXd P;//covariance
+    const Vector3d gravity = Vector3d(0, 0, -9.8);
+    const Vector3d magnetic = Vector3d(1, 0, 0);
+    const double gyro_bias_noise = GYRO_RANDOM_WALK;
+    const double gyro_noise = GYRO_NOISE_DENSITY;
+    const double acc_noise = ACC_NOISE_DENSITY;
+    const double acc_bias_noise = ACC_RANDOM_WALK;
+    const double mag_noise = MAG_NOISE_DENSITY;
+    const double gps_pos_noise = GPS_POS_NOISE_DENSITY;
+    const double gps_vel_noise = GPS_VEL_NOISE_DENSITY;
 
+    MatrixXd Q;
+    MatrixXd Phi;
 
-	const Vector3d GRAVITY = Vector3d(0, 0, 9.8);
-	//covariance parameter
-	const double fix_cov = 2.0;
-	const double sonar_height_cov = 0.2;
-	const double fix_velocity_cov = 2.0;
-	
-	const double gyro_cov = 0.01;
-	const double acc_cov = 0.1;
+    eskf kf;
+    bool is_atti_init_done;
+    bool is_init_done;
 
-	const double gravity_cov = 5.0;
-	const double mag_cov = 5.0;
+    Vector3d delta_vel;
+    Vector3d delta_pos;
+    VectorXd delta_gps;
+    Vector3d delta_theta_acc;
+    Vector3d delta_theta_mag;
 
-	const int n_state = 16;
-	MatrixXd Q;//imu observation noise
-	const MatrixXd R_fix = Matrix2d::Identity()*fix_cov;
-	const MatrixXd R_fix_velocity = Matrix3d::Identity()*fix_velocity_cov;
-	const MatrixXd R_sonar_height = MatrixXd::Identity(1, 1)*sonar_height_cov;
-	const MatrixXd R_magnetic = Matrix3d::Identity()*mag_cov;
-	const MatrixXd R_gravity = Matrix3d::Identity()*gravity_cov;
+    pose_ekf();
+    ~pose_ekf();
 
-	Vector3d acc;
-	Vector3d gyro;
+    void pose_init(Vector3d pos, Vector3d vel);
+    void atti_init(Vector3d acc);
+    void atti_init(Vector3d acc, Vector3d mag);
 
-	Vector3d referenceMagneticField_;
-	double current_t;
-	bool initialized;
+    void predict(Vector3d acc, Vector3d omega_raw, double dt);
 
-	bool fix_initialized;
-	bool imu_initialized;
-	bool altimeter_initialized;
-	bool sonar_initialized;
-	bool magnetic_initialized;
-	
+    void update_gps_vel(Vector3d vel);
+    void update_gps_pos(Vector3d pos);
+    void update_gps(Vector3d pos, Vector3d vel);
+    void update_acc(Vector3d acc);
+    void update_magnetic(Vector3d mag);
+    void update_linear_acc(Vector3d linear_acc, Vector3d acc);
+
+    void set_imu_freq(double freq){this->imu_freq = freq;}
+    void set_Q_matrix(double dt);
+    void set_P_matrix();
+    void update_state();
+    void print_state();
+    Vector3d get_atti_euler();
+    void set_timestatmp(double t){timestamp = t;}
 };
 
-#endif 
+#endif
