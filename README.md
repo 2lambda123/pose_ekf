@@ -19,4 +19,6 @@ error state
     catkin_make -DCATKIN_WHITELIST_PACKAGES="pose_ekf"
     roslaunch pose_ekf pose_ekf_simulator.launch
 
+![image](https://github.com/libing64/pose_ekf/blob/master/pose_ekf.gif) 
+
 # 3.2 rosbag for test (TODO)
